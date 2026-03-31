@@ -37,8 +37,11 @@ AB5E_CMD   = "ab5e0002-5a21-4f05-bc7d-af01f617b664"  # write: commands
 AB5E_AUDIO = "ab5e0003-5a21-4f05-bc7d-af01f617b664"  # notify: audio data
 AB5E_RESP  = "ab5e0004-5a21-4f05-bc7d-af01f617b664"  # notify: command responses
 
-_CHAR_MODEL  = "00002a24-0000-1000-8000-00805f9b34fb"
-_CHAR_SERIAL = "00002a25-0000-1000-8000-00805f9b34fb"
+_CHAR_MODEL   = "00002a24-0000-1000-8000-00805f9b34fb"
+_CHAR_SERIAL  = "00002a25-0000-1000-8000-00805f9b34fb"
+_CHAR_FW      = "00002a26-0000-1000-8000-00805f9b34fb"
+_CHAR_HW      = "00002a27-0000-1000-8000-00805f9b34fb"
+_CHAR_BATTERY = "00002a19-0000-1000-8000-00805f9b34fb"
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 LOG_DIR      = Path("logs")
@@ -101,14 +104,23 @@ async def connect(log: logging.Logger, scan_only: bool = False) -> BleakClient |
 # ─── Device info ──────────────────────────────────────────────────────────────
 
 async def _read_device_info(client: BleakClient, log: logging.Logger) -> dict:
-    """Read Model Number and Serial Number from Device Information Service."""
-    info = {"serial": "", "model": ""}
-    for key, uuid in (("serial", _CHAR_SERIAL), ("model", _CHAR_MODEL)):
+    """Read device metadata from Device Information Service and Battery Service."""
+    info: dict = {"model": "", "serial": "", "fw": "", "hw": "", "battery": -1}
+
+    for key, uuid in (("model", _CHAR_MODEL), ("serial", _CHAR_SERIAL),
+                      ("fw", _CHAR_FW), ("hw", _CHAR_HW)):
         try:
             val = await client.read_gatt_char(uuid)
             info[key] = val.decode("utf-8", errors="replace").strip()
         except Exception:
             pass
+
+    try:
+        val = await client.read_gatt_char(_CHAR_BATTERY)
+        info["battery"] = val[0]  # uint8, 0-100 %
+    except Exception:
+        pass
+
     log.debug(f"Device info: {info}")
     return info
 
@@ -231,9 +243,29 @@ def _convert_and_play(ima_path: Path, wav_path: Path, log: logging.Logger) -> bo
     return True
 
 
+# ─── History log ─────────────────────────────────────────────────────────────
+
+_HISTORY_FILE = LOG_DIR / "history.log"
+
+
+def _append_history(mac: str, model: str, fw: str, hw: str, battery: int,
+                    frames: int, ok: bool) -> None:
+    """Append one line per recording attempt to the cumulative history log."""
+    LOG_DIR.mkdir(exist_ok=True)
+    ts     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status = "OK" if ok else "NO_AUDIO"
+    bat    = f"{battery}%" if battery >= 0 else "n/a"
+    line   = (f"{ts}  {mac}  {model:<16}  "
+              f"fw={fw or 'n/a':<12}  hw={hw or 'n/a':<8}  bat={bat:<4}  "
+              f"frames={frames:4d}  {status}\n")
+    with _HISTORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
 # ─── Summary log ──────────────────────────────────────────────────────────────
 
-def _update_summary(mac: str, model: str, log: logging.Logger) -> None:
+def _update_summary(mac: str, model: str, fw: str, hw: str,
+                    log: logging.Logger) -> None:
     """Append or update the tested-devices JSON log and print running totals."""
     LOG_DIR.mkdir(exist_ok=True)
     try:
@@ -243,10 +275,12 @@ def _update_summary(mac: str, model: str, log: logging.Logger) -> None:
 
     ts = datetime.now().isoformat(timespec="seconds")
     if mac not in data:
-        data[mac] = {"model": model, "first_tested": ts, "last_tested": ts, "test_count": 1}
+        data[mac] = {"model": model, "fw": fw, "hw": hw,
+                     "first_tested": ts, "last_tested": ts, "test_count": 1}
     else:
-        data[mac]["last_tested"] = ts
-        data[mac]["test_count"] = data[mac].get("test_count", 0) + 1
+        data[mac].update({"model": model, "fw": fw, "hw": hw,
+                          "last_tested": ts,
+                          "test_count": data[mac].get("test_count", 0) + 1})
 
     _SUMMARY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     log.info(f"Summary: {len(data)} unique device(s)")
@@ -310,8 +344,12 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
     model    = info["model"] or "G100"
     mac      = client.address
     safe_mac = mac.replace(":", "")
-    print(f"  Device: {model}  |  MAC: {mac}")
-    log.info(f"model={model} addr={mac}")
+    bat      = f"{info['battery']}%" if info["battery"] >= 0 else "n/a"
+    fw       = info["fw"]  or "n/a"
+    hw       = info["hw"]  or "n/a"
+    print(f"  Device:   {model}  |  MAC: {mac}")
+    print(f"  FW: {fw}  |  HW: {hw}  |  Battery: {bat}")
+    log.info(f"model={model} fw={fw} hw={hw} battery={bat} addr={mac}")
 
     LOG_DIR.mkdir(exist_ok=True)
     choice = "Q"
@@ -328,6 +366,7 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
         if not frames:
             print("  No audio received.")
             log.warning("No audio frames captured.")
+            _append_history(mac, model, fw, hw, info["battery"], 0, False)
         else:
             ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
             ima_path = LOG_DIR / f"test_{safe_mac}_{ts}.ima"
@@ -338,7 +377,11 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
 
             raw_path.write_bytes(b"".join(frames))
             ima_path.write_bytes(b"".join(f[6:] for f in frames if len(f) > 6))
-            _convert_and_play(ima_path, wav_path, log)
+            ok = _convert_and_play(ima_path, wav_path, log)
+            _append_history(mac, model, fw, hw, info["battery"], len(frames), ok)
+
+            raw_path.unlink(missing_ok=True)
+            ima_path.unlink(missing_ok=True)
 
         while True:
             print("\n  [Enter] Next  [R] Re-record  [P] Play back  [Q] Quit", end=" ", flush=True)
@@ -369,7 +412,7 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
         log.warning(f"unpair() failed: {e}")
 
     await client.disconnect()
-    _update_summary(mac, model, log)
+    _update_summary(mac, model, fw, hw, log)
     return choice
 
 
