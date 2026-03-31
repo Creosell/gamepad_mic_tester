@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import logging
 import struct
+import subprocess
 import sys
 import time
 import threading
@@ -543,25 +544,22 @@ async def mode_record(cmd_hex: str, seconds: int, audio_uuid: str) -> None:
     print(f"  Frames: {len(frames)}  Total: {total_bytes} B")
     print(f"  First frame: {frames[0].hex()[:60]}")
 
-    # Decode: continuous ADPCM stream, skip 3-byte header per packet (type + seq LE16)
-    pcm = decode_frames(frames, header_offset=3)
-    log.info(f"Decoded {pcm.size} PCM samples ({pcm.size / SAMPLE_RATE:.2f}s)")
-    print(f"  Decoded {pcm.size} samples ({pcm.size / SAMPLE_RATE:.2f}s)")
+    # Вместо decode_frames + _postprocess + _save_wav
+    stream = b"".join(f[4:] for f in frames if len(f) > 4)
+    raw_path = LOG_DIR / f"raw_audio_{ts_str}.raw"
+    raw_path.write_bytes(stream)
 
-    if pcm.size < 100:
-        print("  Too few samples — ADPCM decode may have wrong offset.")
-        return
-
-    audio = _postprocess(pcm, SAMPLE_RATE)
-
-    # Save WAV
     wav_path = LOG_DIR / f"audio_{ts_str}.wav"
-    _save_wav(wav_path, audio, SAMPLE_RATE)
-    print(f"  WAV saved: {wav_path}")
+    subprocess.run([
+        "sox", "-t", "ima", "-e", "ima-adpcm", "-r", "16000", "-N",
+        str(raw_path), "-e", "signed-integer", str(wav_path), "vol", "0.25"
+    ], check=True)
 
     print("  Playing back...")
     import sounddevice as sd  # imported here so PortAudio COM init doesn't affect BLE
-    sd.play(audio, samplerate=SAMPLE_RATE, blocking=True)
+    import soundfile as sf
+    data, fs = sf.read(str(wav_path))
+    sd.play(data, samplerate=fs, blocking=True)
     print("  Playback done.")
 
 
