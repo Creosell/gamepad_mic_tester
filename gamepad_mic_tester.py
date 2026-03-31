@@ -167,7 +167,7 @@ def _decode_adpcm_block_headers(frames: list[bytes], pkt_header: int = 3) -> np.
             continue
         pred = struct.unpack_from("<h", frame, off)[0]
         sidx = max(0, min(88, frame[off + 2]))
-        payload = frame[off + 4:]
+        payload = frame[off + 3:]
         for byte in payload:
             for nibble in (byte & 0x0F, (byte >> 4) & 0x0F):
                 step = _STEP_TABLE[sidx]
@@ -544,23 +544,38 @@ async def mode_record(cmd_hex: str, seconds: int, audio_uuid: str) -> None:
     print(f"  Frames: {len(frames)}  Total: {total_bytes} B")
     print(f"  First frame: {frames[0].hex()[:60]}")
 
-    # Вместо decode_frames + _postprocess + _save_wav
-    stream = b"".join(f[4:] for f in frames if len(f) > 4)
-    raw_path = LOG_DIR / f"raw_audio_{ts_str}.raw"
-    raw_path.write_bytes(stream)
+    # Packet layout (confirmed by sox state-error analysis):
+    #   byte 0    : type
+    #   bytes 1-2 : seq LE uint16
+    #   bytes 3-4 : ADPCM predictor seed (LE int16)  ← IMA block header
+    #   byte  5   : ADPCM step index                 ← IMA block header
+    #   bytes 6+  : raw IMA ADPCM nibbles
+    IMA_OFFSET = 6
+    stream = b"".join(f[IMA_OFFSET:] for f in frames if len(f) > IMA_OFFSET)
+    ima_path = LOG_DIR / f"audio_{ts_str}.ima"
+    ima_path.write_bytes(stream)
+    print(f"  IMA stream: {ima_path}  ({len(stream)} B)")
 
     wav_path = LOG_DIR / f"audio_{ts_str}.wav"
-    subprocess.run([
-        "sox", "-t", "ima", "-e", "ima-adpcm", "-r", "16000", "-N",
-        str(raw_path), "-e", "signed-integer", str(wav_path), "vol", "0.25"
-    ], check=True)
+    try:
+        subprocess.run(
+            ["sox", "-t", "ima", "-r", "16000", "-c", "1", str(ima_path), str(wav_path)],
+            check=True, capture_output=True,
+        )
+        print(f"  WAV saved: {wav_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"  sox error: {e.stderr.decode(errors='replace')}")
+        return
+    except FileNotFoundError:
+        print("  sox not found in PATH")
+        return
 
     print("  Playing back...")
-    import sounddevice as sd  # imported here so PortAudio COM init doesn't affect BLE
+    import sounddevice as sd
     import soundfile as sf
     data, fs = sf.read(str(wav_path))
     sd.play(data, samplerate=fs, blocking=True)
-    print("  Playback done.")
+    print("  Done.")
 
 
 def mode_analyze(raw_path: Path, frame_size: int) -> None:
@@ -614,18 +629,15 @@ def mode_analyze(raw_path: Path, frame_size: int) -> None:
 
     pkt_header = 3  # type byte + seq LE16
 
-    # Variant 1: current decoder (continuous stream, low nibble first, 16 kHz)
+    # Confirmed correct: per-packet IMA block header at bytes 3-5 (pred LE16 + step),
+    # ADPCM nibbles from byte 6 onward. Verified by sox state-error count = 0 at offset 6.
+    _save_variant("adpcm_blk_16k",  _decode_adpcm_block_headers(frames, pkt_header),     16000)
+
+    # Legacy variants (for comparison only — include IMA header bytes as ADPCM data)
     stream = b"".join(f[pkt_header:] for f in frames if len(f) > pkt_header)
     _save_variant("adpcm_16k_lo3",  _decode_adpcm_stream(stream, hi_nibble_first=False), 16000)
-
-    # Variant 2: high nibble first
     _save_variant("adpcm_16k_hi3",  _decode_adpcm_stream(stream, hi_nibble_first=True),  16000)
-
-    # Variant 3: same stream decoded as 8 kHz
     _save_variant("adpcm_8k_lo3",   _decode_adpcm_stream(stream, hi_nibble_first=False),  8000)
-
-    # Variant 4: per-packet IMA block header (predictor+step_index in bytes 3-6)
-    _save_variant("adpcm_blk_16k",  _decode_adpcm_block_headers(frames, pkt_header),     16000)
 
     # Variant 5-6: raw 16-bit PCM (no ADPCM)
     raw_payload = b"".join(f[pkt_header:] for f in frames if len(f) > pkt_header)
