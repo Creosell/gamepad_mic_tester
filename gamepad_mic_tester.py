@@ -558,10 +558,10 @@ async def mode_record(cmd_hex: str, seconds: int, audio_uuid: str) -> None:
 
     wav_path = LOG_DIR / f"audio_{ts_str}.wav"
     try:
-        subprocess.run(
-            ["sox", "-t", "ima", "-r", "16000", "-c", "1", str(ima_path), str(wav_path)],
-            check=True, capture_output=True,
-        )
+        subprocess.run(["sox", "-t", "ima", "-e", "ima-adpcm", "-r", "16000", str(ima_path),
+                        "-e", "signed-integer", str(wav_path), "norm", "-12"],
+                       check=True, capture_output=True,
+                       )
         print(f"  WAV saved: {wav_path}")
     except subprocess.CalledProcessError as e:
         print(f"  sox error: {e.stderr.decode(errors='replace')}")
