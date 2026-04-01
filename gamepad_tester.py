@@ -444,21 +444,49 @@ async def _ble_run(mac: str | None, seconds: int) -> None:
         print("Install bleak:  pip install bleak")
         return
 
-    # Scan first — device must be advertising (not connected to Windows HID)
-    print(f"  Scanning for '{_DEVICE_NAME_BLE}'...")
-    dev = await BleakScanner.find_device_by_name(_DEVICE_NAME_BLE, timeout=10.0)
-    if dev is None:
-        if mac:
-            print(f"  Not in scan — WinRT bypass for {mac}")
-            addr_int = int(mac.replace(":", ""), 16)
-            client   = BleakClient(mac, timeout=15.0)
-            client._backend._device_info = addr_int
-        else:
-            print("  Device not found. Make sure it is removed from Windows Bluetooth and is advertising.")
+    # On Linux: device may already be connected as HID (not advertising).
+    # Build BLEDevice directly from BlueZ D-Bus objects — no scan needed.
+    # On Windows: scan first (WinRT hides HID service so device must be un-paired).
+    _TARGET_MAC = "F4:22:7A:4A:AA:E0"
+    if sys.platform == "linux":
+        import dbus
+        from bleak.backends.bluezdbus.scanner import BleakScannerBlueZDBus
+        addr = (mac or _TARGET_MAC).upper()
+        print(f"  Linux: looking up {addr} in BlueZ D-Bus objects...")
+        bus = dbus.SystemBus()
+        manager = dbus.Interface(
+            bus.get_object("org.bluez", "/"),
+            "org.freedesktop.DBus.ObjectManager",
+        )
+        objects = manager.GetManagedObjects()
+        ble_dev = None
+        for path, ifaces in objects.items():
+            dev_iface = ifaces.get("org.bluez.Device1", {})
+            if str(dev_iface.get("Address", "")).upper() == addr:
+                from bleak.backends.device import BLEDevice
+                details = {"path": path, "props": dev_iface}
+                ble_dev = BLEDevice(addr, str(dev_iface.get("Name", addr)), details, -1)
+                print(f"  Found in D-Bus: {path}")
+                break
+        if ble_dev is None:
+            print(f"  Not found in D-Bus — aborting.")
             return
+        client = BleakClient(ble_dev, timeout=15.0)
     else:
-        print(f"  Found: {dev.address}")
-        client = BleakClient(dev, timeout=15.0)
+        print(f"  Scanning for '{_DEVICE_NAME_BLE}'...")
+        dev = await BleakScanner.find_device_by_name(_DEVICE_NAME_BLE, timeout=10.0)
+        if dev is None:
+            if mac:
+                print(f"  Not in scan — WinRT bypass for {mac}")
+                addr_int = int(mac.replace(":", ""), 16)
+                client   = BleakClient(mac, timeout=15.0)
+                client._backend._device_info = addr_int
+            else:
+                print("  Device not found. Make sure it is removed from Windows Bluetooth and is advertising.")
+                return
+        else:
+            print(f"  Found: {dev.address}")
+            client = BleakClient(dev, timeout=15.0)
 
     def on_report(sender, data: bytearray) -> None:
         b    = bytes(data)
@@ -469,23 +497,24 @@ async def _ble_run(mac: str | None, seconds: int) -> None:
     await client.connect()
     print(f"  Connected: {client.address}")
 
-    # Pair and wait for bonding
-    loop = asyncio.get_running_loop()
-    try:
-        await client.pair()
-    except Exception as e:
-        print(f"  pair() note: {e}")
-
-    print("  Bonding", end="", flush=True)
-    deadline = loop.time() + 30.0
-    _CHAR_MODEL_UUID = "00002a24-0000-1000-8000-00805f9b34fb"
-    while loop.time() < deadline:
+    # On Linux the device is already bonded — skip pair()/bonding wait.
+    if sys.platform != "linux":
+        loop = asyncio.get_running_loop()
         try:
-            await client.read_gatt_char(_CHAR_MODEL_UUID)
-            break
-        except Exception:
-            print(".", end="", flush=True)
-            await asyncio.sleep(1.0)
+            await client.pair()
+        except Exception as e:
+            print(f"  pair() note: {e}")
+
+        print("  Bonding", end="", flush=True)
+        deadline = loop.time() + 30.0
+        _CHAR_MODEL_UUID = "00002a24-0000-1000-8000-00805f9b34fb"
+        while loop.time() < deadline:
+            try:
+                await client.read_gatt_char(_CHAR_MODEL_UUID)
+                break
+            except Exception:
+                print(".", end="", flush=True)
+                await asyncio.sleep(1.0)
     print(" done.\n")
 
     try:
@@ -821,6 +850,163 @@ def mode_ble_probe(mac: str | None = None) -> None:
         raise exc
 
 
+# ─── evdev mode (Linux: reads BlueZ input devices directly) ──────────────────
+
+# ecodes for Consumer Control keys that BlueZ maps from CC HID reports
+_CC_KEY_NAMES: dict[int, str] = {
+    # filled dynamically from evdev.ecodes at runtime
+}
+
+def _build_cc_key_names() -> dict[int, str]:
+    """Map evdev key codes to friendly button names for the G100 CC buttons."""
+    try:
+        from evdev import ecodes
+    except ImportError:
+        return {}
+    mapping = {
+        ecodes.KEY_HOMEPAGE:   "Home",
+        ecodes.KEY_BACK:       "Back",
+        ecodes.KEY_PLAYPAUSE:  "Play",
+    }
+    # Play/SalutLogo may come as KEY_VCR / KEY_SEARCH depending on BlueZ version
+    for attr, name in [("KEY_VCR", "Play"), ("KEY_SEARCH", "SalutLogo"),
+                       ("KEY_MEDIA", "Play"), ("KEY_PROPS", "SalutLogo")]:
+        code = getattr(ecodes, attr, None)
+        if code is not None:
+            mapping[code] = name
+    return mapping
+
+
+_G100_BTN_NAMES: dict[int, str] = {
+    # BTN_SOUTH/EAST/NORTH/WEST → face buttons
+    0x130: "A",        # BTN_SOUTH
+    0x131: "B",        # BTN_EAST
+    0x133: "X",        # BTN_NORTH
+    0x134: "Y",        # BTN_WEST
+    # Bumpers / triggers
+    0x136: "L1",       # BTN_TL
+    0x137: "R1",       # BTN_TR
+    0x138: "L2",       # BTN_TL2
+    0x139: "R2",       # BTN_TR2
+    # Center buttons
+    0x13a: "Share",    # BTN_SELECT
+    0x13b: "Options",  # BTN_START
+    # Stick clicks
+    0x13d: "L3",       # BTN_THUMBL
+    0x13e: "R3",       # BTN_THUMBR
+}
+
+_G100_AXIS_NAMES: dict[int, str] = {
+    0x00: "LX",        # ABS_X
+    0x01: "LY",        # ABS_Y
+    0x02: "RX",        # ABS_Z
+    0x05: "RY",        # ABS_RZ
+    0x0a: "L2",        # ABS_BRAKE
+    0x09: "R2",        # ABS_GAS
+    0x10: "D-pad X",   # ABS_HAT0X
+    0x11: "D-pad Y",   # ABS_HAT0Y
+}
+
+
+def mode_evdev(gamepad_path: str = "/dev/input/event13",
+               cc_path: str     = "/dev/input/event12") -> None:
+    """Read all buttons via BlueZ evdev devices (Linux only).
+
+    event13 / js0  — regular buttons (A/B/X/Y, sticks, D-pad, L1/R1/L2/R2…)
+    event12        — Consumer Controls (Home, Back, Play, SalutLogo)
+    """
+    try:
+        import evdev
+        from evdev import categorize, ecodes
+    except ImportError:
+        print("Install python3-evdev:  sudo apt install python3-evdev")
+        return
+
+    import selectors
+
+    cc_key_names = _build_cc_key_names()
+
+    devices = {}
+    axis_zones: dict[int, int] = {}  # axis_code → last zone (-1, 0, 1)
+
+    def _axis_zone(value: int, mn: int, mx: int) -> int:
+        third = (mx - mn) // 3
+        if value < mn + third:
+            return -1
+        if value > mx - third:
+            return 1
+        return 0
+
+    for path, label in [(gamepad_path, "GAMEPAD"), (cc_path, "CC")]:
+        try:
+            d = evdev.InputDevice(path)
+            devices[d.fd] = (d, label)
+            print(f"  {label}: {d.name} ({path})")
+        except PermissionError:
+            print(f"  {label}: Permission denied — run: sudo usermod -aG input $USER")
+        except FileNotFoundError:
+            print(f"  {label}: {path} not found — is the gamepad connected?")
+
+    if not devices:
+        return
+
+    print("  Press buttons (Ctrl+C to stop)\n")
+
+    sel = selectors.DefaultSelector()
+    for fd, (dev, _) in devices.items():
+        sel.register(fd, selectors.EVENT_READ)
+
+    try:
+        while True:
+            for key, _ in sel.select(timeout=1.0):
+                dev, label = devices[key.fd]
+                for event in dev.read():
+                    if event.type == ecodes.EV_KEY:
+                        key_event = categorize(event)
+                        state     = key_event.keystate  # 0=up, 1=down, 2=hold
+                        if state != 1:
+                            continue  # skip release and auto-repeat
+                        code = key_event.scancode
+                        name = (cc_key_names.get(code)
+                                or _G100_BTN_NAMES.get(code)
+                                or ecodes.KEY.get(code, f"KEY_{code:#05x}"))
+                        print(f"  [{label}] {name}")
+                    elif event.type == ecodes.EV_ABS:
+                        info  = dev.absinfo(event.code)
+                        center = (info.max + info.min) // 2
+                        dead   = max(8, (info.max - info.min) // 20)
+                        delta  = event.value - center
+                        # D-pad hat: show direction, skip release
+                        if event.code in (0x10, 0x11):
+                            if event.value != 0:
+                                direction = ("Right" if event.value > 0 else "Left") if event.code == 0x10 else ("Down" if event.value > 0 else "Up")
+                                print(f"  [{label}] D-pad {direction}")
+                        elif event.code in (0x09, 0x0a):
+                            # L2/R2 analog triggers: report half/full threshold crossings only
+                            axis_name = _G100_AXIS_NAMES.get(event.code, "L2" if event.code == 0x0a else "R2")
+                            val = event.value
+                            prev_val = getattr(dev, f"_prev_{event.code}", 0)
+                            setattr(dev, f"_prev_{event.code}", val)
+                            half, full = info.max // 2, info.max
+                            if prev_val < half <= val:
+                                print(f"  [{label}] {axis_name} ~half")
+                            elif prev_val < full <= val:
+                                print(f"  [{label}] {axis_name} full")
+                        else:
+                            axis_name = _G100_AXIS_NAMES.get(event.code) or ecodes.ABS.get(event.code, f"ABS_{event.code}")
+                            zone = _axis_zone(event.value, info.min, info.max)
+                            if axis_zones.get(event.code) != zone:
+                                axis_zones[event.code] = zone
+                                direction = {-1: "-", 0: "·", 1: "+"}[zone]
+                                print(f"  [{label}] {axis_name} {direction}")
+    except KeyboardInterrupt:
+        print("\n  Stopped.")
+    finally:
+        for dev, _ in devices.values():
+            dev.close()
+        sel.close()
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -843,6 +1029,11 @@ def main():
     elif cmd == "bleprobe":
         mac = args[1] if len(args) > 1 and ":" in args[1] else None
         mode_ble_probe(mac)
+    elif cmd == "evdev":
+        # optional: evdev <gamepad_path> <cc_path>
+        gp = args[1] if len(args) > 1 and args[1].startswith("/") else "/dev/input/event13"
+        cc = args[2] if len(args) > 2 and args[2].startswith("/") else "/dev/input/event12"
+        mode_evdev(gp, cc)
     else:
         print(__doc__)
         sys.exit(1)
