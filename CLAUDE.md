@@ -162,43 +162,81 @@ Handle map confirmed from btsnoop:
 **Root cause:** Windows BLE HID driver intercepts the entire HID service (0x1812) at
 the kernel level, before any user-space API can access it.
 
+### Windows — Untested Approaches (low probability, worth trying)
+
+The following were NOT tested and remain open:
+
+| Approach | Estimated chance | Notes |
+|----------|-----------------|-------|
+| `WH_KEYBOARD_LL` hook for `VK_BROWSER_BACK` (0xA6), `VK_BROWSER_HOME` (0xAC) | ~20% | `keyboard` lib test may have been incomplete — didn't isolate specific VK codes |
+| `pynput` keyboard listener | ~15% | Different internal mechanism than `keyboard` lib; may catch VK codes the other missed |
+| `Windows.Gaming.Input` WinRT API | ~10% | Separate gaming path, untested against this device |
+
+If any of these work, CC buttons would map to VK codes:
+- Back → `VK_BROWSER_BACK` (0xA6)
+- Home → `VK_BROWSER_HOME` (0xAC)
+- Play → `VK_MEDIA_PLAY_PAUSE` (0xB3) — usage 0xCD, not 0x63 (Play ≠ Play/Pause)
+- SalutLogo → no standard VK, likely inaccessible regardless
+
 ---
 
-## Linux TODO (next session on Ubuntu)
+## Linux — DONE ✓
 
-The goal is to detect all 16+ buttons including CC buttons via BLE on Linux/BlueZ.
+All 16+ buttons working via `python3 gamepad_tester.py evdev`.
 
-### Setup
+### How it works
+
+BlueZ acts as HOGP host — subscribes to all HID reports and exposes two `/dev/input/` devices:
+
+| Device | Name | Contents |
+|--------|------|----------|
+| `event13` / `js0` | `GAME` | A/B/X/Y, L1/R1/L2/R2, L3/R3, Share/Options, sticks, D-pad |
+| `event12` | `GAME Consumer Control` | Home, Back, Play, SalutLogo |
+
+### Setup (Ubuntu)
 ```bash
-sudo apt install python3-pip libglib2.0-dev
-pip install bleak
-# Bluetooth stack: BlueZ (built-in on Ubuntu)
+sudo apt install python3-bleak python3-evdev python3-hid
+sudo usermod -aG input $USER   # allow reading /dev/input/event* without sudo
+# re-login or: newgrp input
+bluetoothctl
+  pairable on
+  scan on
+  pair F4:22:7A:4A:AA:E0
+  trust F4:22:7A:4A:AA:E0
+  connect F4:22:7A:4A:AA:E0
+  quit
 ```
 
-### Approach
-BlueZ does NOT intercept the HID service — bleak on Linux can enumerate and subscribe
-to `0x2A4D` (HID Report) characteristics directly.
+### Usage
+```bash
+python3 gamepad_tester.py evdev
+# optional: evdev <gamepad_path> <cc_path>
+# defaults: /dev/input/event13  /dev/input/event12
+```
 
+### evdev key → button mapping (confirmed)
 ```python
-# On Linux, the full HID service IS visible via bleak
-# Subscribe to CCCD at handle 0x0048 to get CC button events on handle 0x0047
-# OR iterate client.services, find 0x1812, subscribe to all 0x2A4D notify chars
+# Regular buttons (EV_KEY on event13)
+KEY_304=A  KEY_305=B  KEY_307=X  KEY_308=Y
+KEY_310=L1 KEY_311=R1 KEY_312=L2 KEY_313=R2
+KEY_314=Share  KEY_315=Options
+KEY_317=L3  KEY_318=R3
+
+# Axes (EV_ABS on event13)
+ABS_X=LX  ABS_Y=LY  ABS_Z=RX  ABS_RZ=RY
+ABS_GAS=R2_analog  ABS_BRAKE=L2_analog
+ABS_HAT0X=D-pad_X  ABS_HAT0Y=D-pad_Y
+
+# CC buttons (EV_KEY on event12)
+KEY_HOMEPAGE=Home  KEY_BACK=Back
+KEY_VCR=Play  KEY_SEARCH=SalutLogo
 ```
 
-### Tasks
-1. Pair gamepad with Ubuntu: `bluetoothctl` → `pair F4:22:7A:4A:AA:E0` → `trust` → `connect`
-2. Run `gamepad_tester.py ble` — should now see HID service in service tree
-3. Verify CC button data arrives on handle `0x0047` as 2-byte LE uint16
-4. Update `gamepad_tester.py` to use Linux BLE path for CC buttons
-5. Implement combined mode: hidapi for regular buttons + BLE for CC buttons
-
-### Expected wire format for CC buttons on Linux
-```python
-# on_notification(sender, data):
-usage = int.from_bytes(data[:2], "little")
-CC_MAP = {0x0223: "Home", 0x0221: "SalutLogo", 0x0063: "Play", 0x0224: "Back"}
-button = CC_MAP.get(usage)  # None on release (usage == 0)
-```
+### Notes
+- HID service (0x1812) is NOT visible via bleak on Linux either — BlueZ input plugin
+  takes it over, same as Windows. The evdev approach reads BlueZ's translated output.
+- `event12`/`event13` device numbers may change after reconnect — check with
+  `grep -A5 "GAME" /proc/bus/input/devices`
 
 ---
 
