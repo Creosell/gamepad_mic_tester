@@ -90,9 +90,10 @@ async def connect(log: logging.Logger, scan_only: bool = False) -> BleakClient |
         log.info(f"Found via scan: {dev.address}")
         client = BleakClient(dev, timeout=15.0)
     elif not scan_only:
-        log.info(f"Not in scan — WinRT bypass for {KNOWN_ADDRESS}")
+        log.info(f"Not in scan — connecting directly to {KNOWN_ADDRESS}")
         client = BleakClient(KNOWN_ADDRESS, timeout=15.0)
-        client._backend._device_info = KNOWN_ADDR_INT
+        if sys.platform == "win32":
+            client._backend._device_info = KNOWN_ADDR_INT
     else:
         return None
 
@@ -207,13 +208,26 @@ async def _capture_audio(client: BleakClient, seconds: int, log: logging.Logger)
 
 
 def _play_wav(wav_path: Path) -> None:
-    """Play a WAV file via PowerShell SoundPlayer (synchronous, no COM side effects)."""
+    """Play a WAV file. Uses PowerShell SoundPlayer on Windows, aplay/paplay/sox on Linux."""
     print("  Playing back...")
-    subprocess.run(
-        ["powershell", "-NoProfile", "-c",
-         f"(New-Object Media.SoundPlayer '{wav_path.resolve()}').PlaySync()"],
-        check=False,
-    )
+    if sys.platform == "win32":
+        subprocess.run(
+            ["powershell", "-NoProfile", "-c",
+             f"(New-Object Media.SoundPlayer '{wav_path.resolve()}').PlaySync()"],
+            check=False,
+        )
+    else:
+        for cmd in (
+            ["aplay", str(wav_path)],
+            ["paplay", str(wav_path)],
+            ["sox", str(wav_path), "-d"],
+        ):
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                return
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+        print("  No audio player found (install aplay or paplay)")
 
 
 def _convert_and_play(ima_path: Path, wav_path: Path, log: logging.Logger) -> bool:
@@ -291,22 +305,47 @@ def _update_summary(mac: str, model: str, fw: str, hw: str,
 # ─── Input ────────────────────────────────────────────────────────────────────
 
 def _read_key() -> str:
-    """Read a single keypress without requiring Enter (Windows msvcrt).
+    """Read a single keypress without requiring Enter.
 
     Returns the uppercase character, empty string for Enter / unrecognised keys.
-    Extended keys (arrows, F-keys) are consumed and discarded.
+    Extended/escape sequences (arrows, F-keys) are consumed and discarded.
     """
-    import msvcrt
-    key = msvcrt.getch()
-    if key in (b"\x00", b"\xe0"):
-        msvcrt.getch()
-        return ""
-    if key in (b"\r", b"\n"):
-        return ""
-    try:
-        return key.decode("utf-8", errors="replace").upper()
-    except Exception:
-        return ""
+    if sys.platform == "win32":
+        import msvcrt
+        key = msvcrt.getch()
+        if key in (b"\x00", b"\xe0"):
+            msvcrt.getch()
+            return ""
+        if key in (b"\r", b"\n"):
+            return ""
+        try:
+            return key.decode("utf-8", errors="replace").upper()
+        except Exception:
+            return ""
+    else:
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        try:
+            old = termios.tcgetattr(fd)
+        except termios.error:
+            ch = sys.stdin.read(1)
+            return "" if ch in ("\r", "\n", "") else ch.upper()
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    sys.stdin.read(2)
+                return ""
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\r", "\n"):
+                return ""
+            return ch.upper()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 # ─── Test flow ────────────────────────────────────────────────────────────────
