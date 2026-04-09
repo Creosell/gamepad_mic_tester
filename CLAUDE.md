@@ -35,8 +35,8 @@ Physical buttons: A / B / X / Y · L1 / R1 / L2 / R2 · L3 / R3 · Share / Optio
 
 ```bash
 pip install bleak hid
-# Linux also needs:
-sudo apt install python3-bluez sox  # or pipx install bleak
+# mic tester also needs sox in PATH (Windows installer from sourceforge.net/projects/sox)
+# button tester Linux evdev mode also needs: sudo apt install python3-evdev
 ```
 
 ---
@@ -242,7 +242,12 @@ KEY_VCR=Play  KEY_SEARCH=SalutLogo
 
 ## Audio Protocol (gamepad_mic_tester.py)
 
-Works on Windows and Linux. BLE audio via `ab5e` Realtek service.
+**Platform: Windows only.** Linux was investigated extensively but dropped — BlueZ leaves
+the device in a persistent "busy" state (`GET_CAPS` returns `0c0f01`) after any START/STOP
+cycle, making subsequent streaming unreliable. The root cause is BlueZ middleware latency
+and GATT caching for bonded devices. The script has no Linux-specific connection code.
+
+BLE audio via `ab5e` Realtek service.
 
 ### GATT characteristics
 
@@ -301,10 +306,8 @@ sox -t ima -e ima-adpcm -r 16000 input.ima -e signed-integer output.wav norm -12
 
 Parameters: 16 000 Hz, mono, IMA ADPCM. `norm -12` normalises headroom to −12 dB.
 
-**Playback:**
-- Windows: `PowerShell (New-Object Media.SoundPlayer 'file.wav').PlaySync()`  
-  (avoids COM/WinRT conflict with bleak — do NOT use `winsound` or `pygame` here)
-- Linux: `aplay` → `paplay` → `sox file.wav -d` (tried in order, first available wins)
+**Playback (Windows):** `PowerShell (New-Object Media.SoundPlayer 'file.wav').PlaySync()`  
+Avoids COM/WinRT conflict with bleak — do NOT use `winsound` or `pygame` here.
 
 ---
 

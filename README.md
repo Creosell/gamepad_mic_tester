@@ -51,38 +51,16 @@ python gamepad_mic_tester.py --seconds 10
 
 ### Установка зависимостей
 
-**Windows и Linux (общее):**
 ```bash
 pip install bleak
 ```
 
-**Windows** — `sox` должен быть в PATH:
+`sox` должен быть в PATH (только Windows):
 - Скачать с https://sourceforge.net/projects/sox/
 - Добавить папку установки в системный PATH
 
-**Linux:**
-```bash
-sudo apt install sox alsa-utils   # sox + aplay
-pip install bleak
-```
-
-### Особенности по платформам
-
-| Функция            | Windows                                   | Linux                          |
-|--------------------|-------------------------------------------|--------------------------------|
-| BLE-подключение    | WinRT backend (обход для сопряжённых устройств) | BlueZ через bleak          |
-| Воспроизведение    | PowerShell `Media.SoundPlayer`            | `aplay` → `paplay` → `sox -d` |
-| Ввод с клавиатуры  | `msvcrt.getch()`                          | `termios` raw mode             |
-| Конвертация аудио  | `sox` (должен быть в PATH)                | `sox` (`apt install sox`)      |
-
-> **Сопряжение на Linux** (если ещё не сделано):
-> ```bash
-> bluetoothctl
->   pairable on; scan on
->   pair F4:22:7A:4A:AA:E0
->   trust F4:22:7A:4A:AA:E0
->   connect F4:22:7A:4A:AA:E0
-> ```
+> **Платформы:** скрипт тестировался и работает на **Windows**.
+> Linux-поддержка аудио не реализована (BlueZ не даёт надёжно управлять streaming-состоянием устройства через bleak).
 
 ---
 

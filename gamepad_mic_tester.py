@@ -3,7 +3,7 @@
 BLE Gamepad Microphone Tester — Realtek G100-4722
 
 Usage:
-    python gamepad_mic_tester.py [--seconds 5]
+    python gamepad_mic_tester.py [--seconds 5] [--debug]
 
 Dependencies:
     pip install bleak sounddevice soundfile
@@ -44,20 +44,23 @@ _CHAR_HW      = "00002a27-0000-1000-8000-00805f9b34fb"
 _CHAR_BATTERY = "00002a19-0000-1000-8000-00805f9b34fb"
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-LOG_DIR      = Path("logs")
+LOG_DIR       = Path("logs")
 _SUMMARY_FILE = LOG_DIR / "tested_devices.json"
+
+# Set to True by --debug flag in main()
+_DEBUG = False
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 _FMT = logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S")
 
 
 def _make_logger(name: str = "mic_tester") -> logging.Logger:
-    """Create a logger with WARNING-level console output and DEBUG-level file output."""
+    """Create a logger. Console level: DEBUG if --debug, else WARNING. File level: always DEBUG."""
     log = logging.getLogger(name)
     log.setLevel(logging.DEBUG)
     if not log.handlers:
         ch = logging.StreamHandler()
-        ch.setLevel(logging.WARNING)
+        ch.setLevel(logging.DEBUG if _DEBUG else logging.WARNING)
         ch.setFormatter(_FMT)
         log.addHandler(ch)
     return log
@@ -80,11 +83,13 @@ def _add_file_handler(log: logging.Logger, tag: str) -> Path:
 async def connect(log: logging.Logger, scan_only: bool = False) -> BleakClient | None:
     """Scan for DEVICE_NAME and connect.
 
-    If scan_only=True, returns None when device not found (instead of WinRT bypass).
-    If scan_only=False, falls back to the known bonded address via WinRT bypass.
+    Scans first; falls back to direct address for already-bonded device on Windows.
+    If scan_only=True, returns None when device not found.
     """
-    log.info(f"Scanning for '{DEVICE_NAME}' ...")
+    log.debug(f"Scanning for '{DEVICE_NAME}' (timeout=6s)...")
     dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=6.0)
+    log.debug(f"Scan result: {'found' if dev else 'not found'}"
+              + (f" — {dev.address}" if dev else ""))
 
     if dev:
         log.info(f"Found via scan: {dev.address}")
@@ -93,13 +98,30 @@ async def connect(log: logging.Logger, scan_only: bool = False) -> BleakClient |
         log.info(f"Not in scan — connecting directly to {KNOWN_ADDRESS}")
         client = BleakClient(KNOWN_ADDRESS, timeout=15.0)
         if sys.platform == "win32":
+            log.debug("Win32: injecting _device_info for WinRT bypass")
             client._backend._device_info = KNOWN_ADDR_INT
     else:
+        log.debug("scan_only=True and device not found — returning None")
         return None
 
+    log.debug("Calling client.connect()...")
     await client.connect()
     log.info(f"Connected: {client.is_connected}")
     return client
+
+
+# ─── GATT diagnostics ────────────────────────────────────────────────────────
+
+async def _debug_list_services(client: BleakClient, log: logging.Logger) -> None:
+    """Log all GATT services and characteristics visible to bleak."""
+    log.debug("=== GATT service map (bleak view) ===")
+    for svc in client.services:
+        log.debug(f"  SVC {svc.uuid}")
+        for char in svc.characteristics:
+            log.debug(f"    CHAR {char.uuid}  props={char.properties}  handle=0x{char.handle:04x}")
+            for desc in char.descriptors:
+                log.debug(f"      DESC {desc.uuid}  handle=0x{desc.handle:04x}")
+    log.debug("=== end service map ===")
 
 
 # ─── Device info ──────────────────────────────────────────────────────────────
@@ -110,19 +132,23 @@ async def _read_device_info(client: BleakClient, log: logging.Logger) -> dict:
 
     for key, uuid in (("model", _CHAR_MODEL), ("serial", _CHAR_SERIAL),
                       ("fw", _CHAR_FW), ("hw", _CHAR_HW)):
+        log.debug(f"Reading {key} ({uuid})...")
         try:
             val = await client.read_gatt_char(uuid)
             info[key] = val.decode("utf-8", errors="replace").strip()
-        except Exception:
-            pass
+            log.debug(f"  {key} = {info[key]!r}")
+        except Exception as e:
+            log.debug(f"  {key} read failed: {type(e).__name__}: {e}")
 
+    log.debug(f"Reading battery ({_CHAR_BATTERY})...")
     try:
         val = await client.read_gatt_char(_CHAR_BATTERY)
         info["battery"] = val[0]  # uint8, 0-100 %
-    except Exception:
-        pass
+        log.debug(f"  battery = {info['battery']}%")
+    except Exception as e:
+        log.debug(f"  battery read failed: {type(e).__name__}: {e}")
 
-    log.debug(f"Device info: {info}")
+    log.debug(f"Device info complete: {info}")
     return info
 
 
@@ -131,27 +157,33 @@ async def _read_device_info(client: BleakClient, log: logging.Logger) -> dict:
 async def _warmup(client: BleakClient, log: logging.Logger) -> None:
     """Fire one GET_CAPS → START → STOP cycle to prime the device audio pipeline.
 
-    After pairing, the first START cycle is acknowledged but produces no audio.
-    This burn-in cycle ensures the following _capture_audio call works immediately.
+    After the very first BLE pairing the device ignores the first START command.
+    This dummy cycle primes the firmware so the next capture works correctly.
     """
+    log.debug("Warmup: starting (GET_CAPS → START → STOP dummy cycle)")
     ready = asyncio.Event()
 
     def on_resp(sender, data: bytearray):
+        log.debug(f"Warmup: RESP notification: {bytes(data).hex()}")
         if data and data[0] == 0x0C:
+            log.debug("Warmup: GET_CAPS acknowledged (0x0C)")
             ready.set()
 
     await client.start_notify(AB5E_RESP, on_resp)
+
     await client.write_gatt_char(AB5E_CMD, bytes([0x0C, 0x00]), response=False)
     try:
         await asyncio.wait_for(ready.wait(), timeout=5.0)
     except asyncio.TimeoutError:
-        log.warning("Warm-up: GET_CAPS timeout")
+        log.warning("Warmup: GET_CAPS timeout (5s) — no response on AB5E_RESP")
+
     await client.write_gatt_char(AB5E_CMD, bytes([0x0A, 0x00]), response=False)
     await asyncio.sleep(0.2)
     await client.write_gatt_char(AB5E_CMD, bytes([0x0B, 0x00]), response=False)
     await asyncio.sleep(0.3)
+
     await client.stop_notify(AB5E_RESP)
-    log.info("Warm-up complete.")
+    log.debug("Warmup: complete")
 
 
 async def _capture_audio(client: BleakClient, seconds: int, log: logging.Logger) -> list[bytes]:
@@ -163,54 +195,93 @@ async def _capture_audio(client: BleakClient, seconds: int, log: logging.Logger)
     frames: list[bytes] = []
     recording = False
     caps_received = asyncio.Event()
+    start_acked  = asyncio.Event()
 
     def on_audio(sender, data: bytearray):
         if recording:
+            n = len(frames)
             frames.append(bytes(data))
+            if n < 5 or n % 50 == 0:
+                log.debug(f"Audio frame #{n + 1}: total={len(data)}B  "
+                          f"header={bytes(data[:6]).hex()}  adpcm={max(0, len(data) - 6)}B")
 
     def on_resp(sender, data: bytearray):
-        log.debug(f"RESP {bytes(data).hex()}")
-        if data:
+        b = bytes(data)
+        log.debug(f"Capture: RESP notification: {b.hex()}")
+        if b:
             caps_received.set()
+        # START ack: device replies with 0x0B (STOP code) as stream-start confirmation
+        if b and b[0] == 0x0B:
+            log.debug("Capture: START ack received (0x0B)")
+            start_acked.set()
 
-    await client.start_notify(AB5E_AUDIO, on_audio)
-    await client.start_notify(AB5E_RESP, on_resp)
+    log.debug("Capture: subscribing to AB5E_AUDIO and AB5E_RESP...")
+    try:
+        await client.start_notify(AB5E_AUDIO, on_audio)
+        log.debug("Capture: AB5E_AUDIO subscribed OK")
+    except Exception as e:
+        log.error(f"Capture: AB5E_AUDIO start_notify FAILED: {type(e).__name__}: {e}")
+    try:
+        await client.start_notify(AB5E_RESP, on_resp)
+        log.debug("Capture: AB5E_RESP subscribed OK")
+    except Exception as e:
+        log.error(f"Capture: AB5E_RESP start_notify FAILED: {type(e).__name__}: {e}")
+    log.debug("Capture: subscriptions active")
 
+    log.debug("Capture: sending GET_CAPS (0x0C 0x00)...")
     await client.write_gatt_char(AB5E_CMD, bytes([0x0C, 0x00]), response=False)
     try:
         await asyncio.wait_for(caps_received.wait(), timeout=5.0)
-        log.info("GET_CAPS acknowledged — sending START")
+        log.debug("Capture: GET_CAPS acknowledged")
     except asyncio.TimeoutError:
-        log.warning("GET_CAPS timeout — sending START anyway")
+        log.warning("GET_CAPS timeout (5s) — sending START anyway")
+
+    log.debug("Capture: sending START (0x0A 0x00)...")
+    await client.write_gatt_char(AB5E_CMD, bytes([0x0A, 0x00]), response=False)
+    try:
+        await asyncio.wait_for(start_acked.wait(), timeout=3.0)
+        log.debug("Capture: stream ack received — recording")
+    except asyncio.TimeoutError:
+        log.debug("Capture: no stream ack within 3s — recording anyway")
 
     recording = True
-    await client.write_gatt_char(AB5E_CMD, bytes([0x0A, 0x00]), response=False)
     log.info(f"Recording {seconds}s...")
+    log.debug(f"Capture: recording started, collecting for {seconds}s")
 
     for remaining in range(seconds, 0, -1):
         print(f"\r  Recording: {remaining}s  ", end="", flush=True)
         await asyncio.sleep(1)
+        log.debug(f"Capture: tick — {len(frames)} frames so far")
     print("\r  Recording done.      ")
 
     recording = False
-    for stop in (bytes([0x0B, 0x00]), bytes([0x00, 0x00])):
+    log.debug(f"Capture: recording stopped — {len(frames)} frames collected so far")
+
+    for label, stop in (("STOP", bytes([0x0B, 0x00])), ("STOP-alt", bytes([0x00, 0x00]))):
         try:
+            log.debug(f"Capture: sending {label} ({stop.hex()})...")
             await client.write_gatt_char(AB5E_CMD, stop, response=False)
             await asyncio.sleep(0.05)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"Capture: {label} write failed: {type(e).__name__}: {e}")
 
     await client.stop_notify(AB5E_AUDIO)
     await client.stop_notify(AB5E_RESP)
+    log.debug("Capture: unsubscribed from AB5E_AUDIO and AB5E_RESP")
 
-    log.info(f"Captured {len(frames)} frames ({sum(len(f) for f in frames)} B)")
+    total_raw  = sum(len(f) for f in frames)
+    total_adpcm = sum(max(0, len(f) - 6) for f in frames)
+    log.info(f"Captured {len(frames)} frames ({total_raw} B raw, {total_adpcm} B ADPCM)")
+    log.debug(f"Capture: avg frame size = {total_raw // len(frames) if frames else 0} B")
     return frames
 
 
-def _play_wav(wav_path: Path) -> None:
+def _play_wav(wav_path: Path, log: logging.Logger | None = None) -> None:
     """Play a WAV file. Uses PowerShell SoundPlayer on Windows, aplay/paplay/sox on Linux."""
     print("  Playing back...")
     if sys.platform == "win32":
+        if log:
+            log.debug(f"Playback: PowerShell SoundPlayer — {wav_path}")
         subprocess.run(
             ["powershell", "-NoProfile", "-c",
              f"(New-Object Media.SoundPlayer '{wav_path.resolve()}').PlaySync()"],
@@ -222,38 +293,54 @@ def _play_wav(wav_path: Path) -> None:
             ["paplay", str(wav_path)],
             ["sox", str(wav_path), "-d"],
         ):
+            if log:
+                log.debug(f"Playback: trying {cmd[0]}...")
             try:
                 subprocess.run(cmd, check=True, capture_output=True)
+                if log:
+                    log.debug(f"Playback: {cmd[0]} succeeded")
                 return
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                continue
+            except FileNotFoundError:
+                if log:
+                    log.debug(f"Playback: {cmd[0]} not found — skipping")
+            except subprocess.CalledProcessError as e:
+                if log:
+                    log.debug(f"Playback: {cmd[0]} failed (rc={e.returncode}): "
+                              f"{e.stderr.decode(errors='replace').strip()}")
         print("  No audio player found (install aplay or paplay)")
 
 
 def _convert_and_play(ima_path: Path, wav_path: Path, log: logging.Logger) -> bool:
-    """Convert raw IMA file to WAV via sox and play back with sounddevice.
+    """Convert raw IMA file to WAV via sox and play back.
 
     Packet IMA block headers (bytes 0-5: type+seq+pred+step) are already stripped;
     ima_path contains only raw ADPCM nibbles starting at packet offset 6.
     Returns True on success.
     """
+    ima_size = ima_path.stat().st_size
+    log.debug(f"sox input: {ima_path} ({ima_size} B)")
+    sox_cmd = ["sox", "-t", "ima", "-e", "ima-adpcm", "-r", "16000", str(ima_path),
+               "-e", "signed-integer", str(wav_path), "norm", "-12"]
+    log.debug(f"sox command: {' '.join(sox_cmd)}")
     try:
-        subprocess.run(
-            ["sox", "-t", "ima", "-e", "ima-adpcm", "-r", "16000", str(ima_path),
-             "-e", "signed-integer", str(wav_path), "norm", "-12"],
-            check=True, capture_output=True,
-        )
+        result = subprocess.run(sox_cmd, check=True, capture_output=True)
+        if result.stderr:
+            log.debug(f"sox stderr: {result.stderr.decode(errors='replace').strip()}")
     except subprocess.CalledProcessError as e:
-        print(f"  sox error: {e.stderr.decode(errors='replace')}")
-        log.error(f"sox failed: {e.stderr.decode(errors='replace')}")
+        stderr = e.stderr.decode(errors="replace")
+        print(f"  sox error: {stderr}")
+        log.error(f"sox failed (rc={e.returncode}): {stderr}")
         return False
     except FileNotFoundError:
         print("  sox not found in PATH")
+        log.error("sox not found in PATH")
         return False
 
+    wav_size = wav_path.stat().st_size
+    log.debug(f"sox output: {wav_path} ({wav_size} B)")
     log.info(f"WAV: {wav_path}")
     print(f"  WAV: {wav_path}")
-    _play_wav(wav_path)
+    _play_wav(wav_path, log)
     return True
 
 
@@ -291,10 +378,12 @@ def _update_summary(mac: str, model: str, fw: str, hw: str,
     if mac not in data:
         data[mac] = {"model": model, "fw": fw, "hw": hw,
                      "first_tested": ts, "last_tested": ts, "test_count": 1}
+        log.debug(f"Summary: new device added — {mac}")
     else:
         data[mac].update({"model": model, "fw": fw, "hw": hw,
                           "last_tested": ts,
                           "test_count": data[mac].get("test_count", 0) + 1})
+        log.debug(f"Summary: existing device updated — {mac} (test #{data[mac]['test_count']})")
 
     _SUMMARY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     log.info(f"Summary: {len(data)} unique device(s)")
@@ -351,34 +440,20 @@ def _read_key() -> str:
 # ─── Test flow ────────────────────────────────────────────────────────────────
 
 async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logger) -> str:
-    """Pair, warm-up, run the record loop, unpair.  Returns the last user choice."""
+    """Warm-up, run the record loop, unpair.  Returns the last user choice."""
     loop_ev = asyncio.get_running_loop()
 
-    # Pair
-    try:
-        await client.pair()
-        log.info("pair() sent — waiting for bonding...")
-    except Exception as e:
-        log.warning(f"pair() failed: {e}")
-
-    print("  Pairing...", end="", flush=True)
-    deadline = loop_ev.time() + 30.0
-    while loop_ev.time() < deadline:
-        try:
-            await client.read_gatt_char(_CHAR_MODEL)
-            break
-        except Exception:
-            print(".", end="", flush=True)
-            await asyncio.sleep(1.0)
-    else:
-        print(" timeout!")
-        log.warning("Pairing timeout — proceeding anyway")
-    print(" done.")
-
     print("  Initialising...", end="", flush=True)
+    if _DEBUG:
+        await _debug_list_services(client, log)
+
+    log.debug("Starting warmup cycle...")
+    t0 = loop_ev.time()
     await _warmup(client, log)
+    log.debug(f"Warmup complete in {loop_ev.time() - t0:.2f}s")
     print(" done.")
 
+    log.debug("Reading device info...")
     info     = await _read_device_info(client, log)
     model    = info["model"] or "G100"
     mac      = client.address
@@ -400,7 +475,10 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
         await asyncio.sleep(0.5)
         print("  *** GO ***")
 
+        log.debug(f"Starting capture ({seconds}s)...")
+        t0 = loop_ev.time()
         frames = await _capture_audio(client, seconds, log)
+        log.debug(f"Capture finished in {loop_ev.time() - t0:.2f}s — {len(frames)} frames")
 
         if not frames:
             print("  No audio received.")
@@ -414,13 +492,21 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
             for old in LOG_DIR.glob(f"test_{safe_mac}.wav"):
                 old.unlink(missing_ok=True)
 
-            raw_path.write_bytes(b"".join(frames))
-            ima_path.write_bytes(b"".join(f[6:] for f in frames if len(f) > 6))
+            raw_bytes = b"".join(frames)
+            raw_path.write_bytes(raw_bytes)
+            log.debug(f"Raw .bin written: {raw_path} ({len(raw_bytes)} B)")
+
+            adpcm_bytes = b"".join(f[6:] for f in frames if len(f) > 6)
+            ima_path.write_bytes(adpcm_bytes)
+            log.debug(f"IMA written: {ima_path} ({len(adpcm_bytes)} B ADPCM, "
+                      f"skipped {sum(1 for f in frames if len(f) <= 6)} short frames)")
+
             ok = _convert_and_play(ima_path, wav_path, log)
             _append_history(mac, model, fw, hw, info["battery"], len(frames), ok)
 
             raw_path.unlink(missing_ok=True)
             ima_path.unlink(missing_ok=True)
+            log.debug("Temp files cleaned up")
 
         while True:
             print("\n  [Enter] Next  [R] Re-record  [P] Play back  [Q] Quit", end=" ", flush=True)
@@ -434,7 +520,7 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
                 break
             if key == "P":
                 if wav_path.exists():
-                    _play_wav(wav_path)
+                    _play_wav(wav_path, log)
                 else:
                     print("  No WAV file to play.")
             elif key == "Q":
@@ -444,13 +530,20 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
         if choice in ("N", "Q"):
             break
 
+    log.debug(f"Session choice: {choice} — disconnecting")
     try:
         await client.unpair()
         print("  Unpaired.")
+        log.debug("Unpaired OK")
     except Exception as e:
         log.warning(f"unpair() failed: {e}")
 
-    await client.disconnect()
+    try:
+        await client.disconnect()
+        log.debug("Disconnected OK")
+    except Exception as e:
+        log.warning(f"disconnect error: {e}")
+
     _update_summary(mac, model, fw, hw, log)
     return choice
 
@@ -458,35 +551,70 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
 async def mode_test(seconds: int) -> None:
     """Cyclic mic test: scan → pair → record loop → unpair → next device."""
     log = _make_logger()
-    _add_file_handler(log, "test")
+    log_path = _add_file_handler(log, "test")
+    log.debug(f"Session started — seconds={seconds} debug={_DEBUG} log={log_path}")
 
     print()
     print("  ╔══════════════════════════════════════════╗")
     print("  ║    Gamepad Microphone Test — G100        ║")
     print("  ╚══════════════════════════════════════════╝")
+    if _DEBUG:
+        print(f"  [debug mode — log: {log_path}]")
 
     while True:
         print()
         print("  Waiting for device 'GAME'...")
         client = None
         while client is None:
+            print("  Scanning...", end="\r", flush=True)
             client = await connect(log, scan_only=True)
             if client is None:
+                log.debug("Device not found — retrying in 2s")
                 await asyncio.sleep(2.0)
 
+        log.debug(f"Device found and connected: {client.address}")
         choice = await _test_one_device(client, seconds, log)
         if choice == "Q":
             break
 
+    log.debug("Session ended by user")
     print("\n  Session ended.")
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
+class _Tee:
+    """Write to both a stream and a file simultaneously."""
+    def __init__(self, stream, path: Path):
+        self._stream = stream
+        path.parent.mkdir(exist_ok=True)
+        self._file = path.open("w", encoding="utf-8", errors="replace")
+
+    def write(self, data):
+        self._stream.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._file.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def main() -> None:
+    global _DEBUG
     p = argparse.ArgumentParser(description="BLE Gamepad Mic Tester — Realtek G100")
     p.add_argument("--seconds", type=int, default=5, help="Record duration in seconds (default 5)")
+    p.add_argument("--debug", action="store_true", help="Enable verbose debug output on console and in log files")
     args = p.parse_args()
+
+    _DEBUG = args.debug
+
+    # Tee all console output to logs/last_run.log
+    _log_path = LOG_DIR / "last_run.log"
+    sys.stdout = _Tee(sys.stdout, _log_path)
+    sys.stderr = _Tee(sys.stderr, _log_path)
 
     exc: BaseException | None = None
 
