@@ -242,11 +242,69 @@ KEY_VCR=Play  KEY_SEARCH=SalutLogo
 
 ## Audio Protocol (gamepad_mic_tester.py)
 
-Works on Windows. BLE audio via `ab5e` service:
-- Write `0x0C 0x00` to `ab5e0002` → GET_CAPS response on `ab5e0004`
-- Audio data streams on `ab5e0003` as IMA ADPCM frames
-- Conversion: `sox input.ima -r 16000 -e signed -b 16 -c 1 output.wav`
-- Playback: PowerShell `SoundPlayer.PlaySync()` (avoids COM/WinRT conflict with bleak)
+Works on Windows and Linux. BLE audio via `ab5e` Realtek service.
+
+### GATT characteristics
+
+| UUID       | Direction       | Purpose                          |
+|------------|-----------------|----------------------------------|
+| `ab5e0002` | write           | Command channel                  |
+| `ab5e0003` | notify          | Audio data stream (IMA ADPCM)    |
+| `ab5e0004` | notify          | Command responses / control      |
+
+### Commands
+
+| Bytes        | Name      | Description                              |
+|--------------|-----------|------------------------------------------|
+| `0x0C 0x00`  | GET_CAPS  | Request capabilities; device responds on `ab5e0004` (first byte `0x0C`) |
+| `0x0A 0x00`  | START     | Begin audio streaming on `ab5e0003`      |
+| `0x0B 0x00`  | STOP      | Stop streaming                           |
+| `0x00 0x00`  | STOP alt  | Secondary stop (sent after `0x0B 0x00`)  |
+
+### Capture flow
+
+1. Subscribe to notifications on `ab5e0003` (audio) and `ab5e0004` (responses)
+2. Send `GET_CAPS` (`0x0C 0x00`) — wait for response on `ab5e0004` (up to 5 s)
+3. Send `START` (`0x0A 0x00`) — device begins streaming frames
+4. Collect frames from `ab5e0003` for the desired duration
+5. Send `STOP` (`0x0B 0x00`), then `0x00 0x00` (50 ms apart)
+6. Unsubscribe
+
+### Warm-up (critical)
+
+**After the very first BLE pairing, the first START cycle produces no audio frames.**
+The device acknowledges GET_CAPS and START normally, but `ab5e0003` stays silent.
+
+Fix: run one dummy `GET_CAPS → START → STOP` cycle immediately after connect/pair,
+before showing the user any UI. Implemented in `_warmup()`. The next cycle works correctly.
+
+This is a device firmware behaviour, not a timing or subscription issue.
+
+### Audio packet format
+
+Each notification on `ab5e0003` is one IMA ADPCM packet:
+
+```
+bytes[0:1]  — packet type / sequence (header, discard)
+bytes[2:3]  — predictor (ADPCM state, discard)
+bytes[4:5]  — step index  (ADPCM state, discard)
+bytes[6:]   — raw ADPCM nibbles (keep these for sox)
+```
+
+Only `bytes[6:]` of each packet are written to the `.ima` file.
+
+### Conversion & playback
+
+```bash
+sox -t ima -e ima-adpcm -r 16000 input.ima -e signed-integer output.wav norm -12
+```
+
+Parameters: 16 000 Hz, mono, IMA ADPCM. `norm -12` normalises headroom to −12 dB.
+
+**Playback:**
+- Windows: `PowerShell (New-Object Media.SoundPlayer 'file.wav').PlaySync()`  
+  (avoids COM/WinRT conflict with bleak — do NOT use `winsound` or `pygame` here)
+- Linux: `aplay` → `paplay` → `sox file.wav -d` (tried in order, first available wins)
 
 ---
 
