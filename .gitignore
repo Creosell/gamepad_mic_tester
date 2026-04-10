@@ -7,3 +7,6 @@
 /.idea/inspectionProfiles/profiles_settings.xml
 /.idea/vcs.xml
 /out.wav
+/franken_btmon.btsnoop
+/franken_btmon.log
+/franken_last_run.log

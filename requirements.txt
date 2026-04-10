@@ -7,3 +7,4 @@ scipy>=1.17.1
 typing_extensions>=4.15.0
 soundfile>=0.13.1
 sounddevice>=0.5.5
+hid>=1.0.9
