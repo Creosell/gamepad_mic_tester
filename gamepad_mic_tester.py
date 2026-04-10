@@ -20,7 +20,6 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from pathlib import Path
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
