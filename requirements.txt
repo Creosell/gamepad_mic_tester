@@ -1,6 +1,7 @@
 pip>=26.0
 cffi>=2.0.0
 bleak>=3.0.1
+dbus-next>=0.2.3
 numpy>=2.4.4
 scipy>=1.17.1
 typing_extensions>=4.15.0

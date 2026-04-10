@@ -12,12 +12,14 @@ Dependencies:
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import subprocess
 import sys
 import threading
 from datetime import datetime
+from pathlib import Path
 from pathlib import Path
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -455,6 +457,114 @@ async def _test_one_device(client: BleakClient, seconds: int, log: logging.Logge
     return choice
 
 
+async def mode_sniff(seconds: int) -> None:
+    """Debug: pair, subscribe to ALL notify characteristics, send START, dump everything."""
+    log = _make_logger()
+    _add_file_handler(log, "sniff")
+
+    print()
+    print("  ╔══════════════════════════════════════════╗")
+    print("  ║    Gamepad Sniff Mode — G100             ║")
+    print("  ╚══════════════════════════════════════════╝")
+    print()
+    print("  Waiting for device 'GAME'...")
+
+    client = None
+    while client is None:
+        client = await connect(log, scan_only=True)
+        if client is None:
+            await asyncio.sleep(2.0)
+
+    try:
+        await client.pair()
+    except Exception as e:
+        log.warning(f"pair() failed: {e}")
+
+    print("  Pairing...", end="", flush=True)
+    loop_ev = asyncio.get_running_loop()
+    deadline = loop_ev.time() + 30.0
+    while loop_ev.time() < deadline:
+        try:
+            await client.read_gatt_char(_CHAR_MODEL)
+            break
+        except Exception:
+            print(".", end="", flush=True)
+            await asyncio.sleep(1.0)
+    print(" done.")
+
+    print("  Warm-up...", end="", flush=True)
+    await _warmup(client, log)
+    print(" done.")
+
+    info = await _read_device_info(client, log)
+    print(f"  Model: {info['model']}  FW: {info['fw']}  HW: {info['hw']}  Battery: {info['battery']}%")
+    print()
+
+    # Subscribe to every notifiable characteristic
+    received: dict[str, list[bytes]] = {}
+
+    def make_cb(uuid: str, label: str):
+        received[uuid] = []
+        def cb(sender, data: bytearray):
+            b = bytes(data)
+            received[uuid].append(b)
+            ts = asyncio.get_event_loop().time()
+            print(f"  [{label}] #{len(received[uuid]):3d}  {len(b):3d}B  {b.hex()}")
+            log.debug(f"NOTIFY {uuid} #{len(received[uuid])} {len(b)}B {b.hex()}")
+        return cb
+
+    subs = []
+    for svc in client.services:
+        for ch in svc.characteristics:
+            if "notify" in ch.properties or "indicate" in ch.properties:
+                label = ch.uuid[:8]
+                try:
+                    await client.start_notify(ch.uuid, make_cb(ch.uuid, label))
+                    subs.append(ch.uuid)
+                    print(f"  subscribed: {ch.uuid}")
+                except Exception as e:
+                    print(f"  subscribe failed {ch.uuid}: {e}")
+
+    print()
+    print(f"  Sending GET_CAPS + START — speak into mic for {seconds}s...")
+    print()
+    try:
+        await client.write_gatt_char(AB5E_CMD, bytes([0x0C, 0x00]), response=False)
+        await asyncio.sleep(0.5)
+        await client.write_gatt_char(AB5E_CMD, bytes([0x0A, 0x00]), response=False)
+        await asyncio.sleep(seconds)
+        await client.write_gatt_char(AB5E_CMD, bytes([0x0B, 0x00]), response=False)
+        await asyncio.sleep(0.3)
+    except Exception as e:
+        print(f"  write error: {e}")
+
+    for uuid in subs:
+        try:
+            await client.stop_notify(uuid)
+        except Exception:
+            pass
+
+    print()
+    print("  ── Sniff summary ──────────────────────────────────────────────")
+    for uuid, frames in received.items():
+        if frames:
+            sizes = sorted(set(len(f) for f in frames))
+            total = sum(len(f) for f in frames)
+            print(f"  {uuid}  {len(frames):4d} frames  {total:6d} B  sizes={sizes}")
+            if frames:
+                print(f"    first: {frames[0].hex()}")
+                if len(frames) > 1:
+                    print(f"    last:  {frames[-1].hex()}")
+
+    try:
+        await client.unpair()
+    except Exception:
+        pass
+    await client.disconnect()
+    print()
+    print("  Done. Check logs/ for full debug log.")
+
+
 async def mode_test(seconds: int) -> None:
     """Cyclic mic test: scan → pair → record loop → unpair → next device."""
     log = _make_logger()
@@ -483,17 +593,39 @@ async def mode_test(seconds: int) -> None:
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
+class _Tee(io.TextIOBase):
+    """Write to both the real stdout and a log file simultaneously."""
+    def __init__(self, real, log_file):
+        self._real = real
+        self._log  = log_file
+
+    def write(self, s):
+        self._real.write(s)
+        self._log.write(s)
+        return len(s)
+
+    def flush(self):
+        self._real.flush()
+        self._log.flush()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="BLE Gamepad Mic Tester — Realtek G100")
     p.add_argument("--seconds", type=int, default=5, help="Record duration in seconds (default 5)")
+    p.add_argument("--sniff",   action="store_true",  help="Debug: dump all BLE notifications instead of recording")
     args = p.parse_args()
+
+    log_path = Path("last_run.log")
+    log_file = log_path.open("w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
 
     exc: BaseException | None = None
 
     def _run():
         nonlocal exc
         try:
-            asyncio.run(mode_test(args.seconds))
+            coro = mode_sniff(args.seconds) if args.sniff else mode_test(args.seconds)
+            asyncio.run(coro)
         except KeyboardInterrupt:
             pass
         except BaseException as e:
@@ -505,7 +637,9 @@ def main() -> None:
         t.join()
     except KeyboardInterrupt:
         print("\nInterrupted.")
-        sys.exit(0)
+    finally:
+        sys.stdout = sys.__stdout__
+        log_file.close()
 
     if exc is not None:
         raise exc
